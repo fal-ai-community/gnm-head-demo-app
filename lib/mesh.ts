@@ -3,6 +3,14 @@
  * GLTFLoader can parse, and for triggering a download of the raw GLB.
  */
 
+/**
+ * What the viewer should display: a GLB blob from the HTTP API, or raw
+ * realtime geometry rendered directly (never converted back to GLB/base64).
+ */
+export type ViewerMesh =
+  | { kind: 'glb'; dataUri: string }
+  | { kind: 'geometry'; positions: Float32Array; indices: Uint32Array };
+
 export interface DecodedDataUri {
   contentType: string;
   bytes: Uint8Array;

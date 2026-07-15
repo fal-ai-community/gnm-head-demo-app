@@ -3,6 +3,10 @@
  *
  * Field names, enum values, and numeric bounds here mirror the fal registry app
  * (`registry/three_d/gnm_head.py`) exactly. Keep them in sync with that schema.
+ *
+ * The realtime WebSocket transport reuses these same shapes, minus the
+ * HTTP-only `output_format` / `sync_mode` fields, which `lib/protocol.ts`
+ * strips when building the wire request.
  */
 
 export type Mode = 'semantic' | 'blend' | 'advanced';
@@ -106,6 +110,9 @@ export interface AdvancedInput {
   output_format: 'glb';
   sync_mode: true;
 }
+
+/** Any of the three modes' inputs. */
+export type GnmInput = SemanticInput | BlendInput | AdvancedInput;
 
 // --- Result shape ------------------------------------------------------------
 

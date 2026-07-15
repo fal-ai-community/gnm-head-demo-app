@@ -15,11 +15,17 @@ import {
   defaultSemanticInput,
   type AdvancedInput,
   type BlendInput,
+  type GnmInput,
   type GnmResult,
   type Mode,
   type SemanticInput,
 } from '@/lib/gnm';
-import { decodeDataUri, downloadBytes } from '@/lib/mesh';
+import { decodeDataUri, downloadBytes, type ViewerMesh } from '@/lib/mesh';
+import {
+  REALTIME_INACTIVITY_MS,
+  RealtimeSession,
+  type RealtimeConnectionState,
+} from '@/lib/realtimeSession';
 import { useDebouncedCallback } from '@/lib/useDebouncedCallback';
 
 // The viewer touches WebGL/DOM, so it must never run during static prerender.
@@ -37,6 +43,23 @@ const TABS: { id: Mode; label: string }[] = [
   { id: 'advanced', label: 'Advanced' },
 ];
 
+/**
+ * Auto-generate debounce per transport: fal.run pays a full HTTP round-trip
+ * per request, realtime frames are cheap and should feel live.
+ */
+const HTTP_DEBOUNCE_MS = 450;
+const REALTIME_DEBOUNCE_MS = 100;
+
+const MAX_TRANSPORT_EVENTS = 20;
+
+/** Telemetry from the most recent successful generation, on either transport. */
+interface MeshStats {
+  vertices: number;
+  faces: number;
+  seed: number | null;
+  handlerMs: number | null;
+}
+
 export default function Home() {
   const [apiKey, setApiKey] = useState('');
   const [remember, setRemember] = useState(false);
@@ -48,16 +71,27 @@ export default function Home() {
 
   const [autoGenerate, setAutoGenerate] = useState(true);
   const [wireframe, setWireframe] = useState(false);
+  const [realtime, setRealtime] = useState(false);
 
   const [status, setStatus] = useState<RequestStatus>('idle');
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
-  const [result, setResult] = useState<GnmResult | null>(null);
-  const [meshDataUri, setMeshDataUri] = useState<string | null>(null);
+  const [stats, setStats] = useState<MeshStats | null>(null);
+  const [viewerMesh, setViewerMesh] = useState<ViewerMesh | null>(null);
+  const [glbResult, setGlbResult] = useState<GnmResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [logLines, setLogLines] = useState<string[]>([]);
+  const [events, setEvents] = useState<string[]>([]);
+  const [connectionState, setConnectionState] = useState<RealtimeConnectionState>('idle');
+  const [deadlineAt, setDeadlineAt] = useState<number | null>(null);
+  const [closesInS, setClosesInS] = useState<number | null>(null);
 
   const requestIdRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
+  const sessionRef = useRef<RealtimeSession | null>(null);
+  const modeRef = useRef<Mode>(mode);
+
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
 
   // --- Restore a remembered key (opt-in, sessionStorage only) ---
   useEffect(() => {
@@ -104,7 +138,92 @@ export default function Home() {
     [remember],
   );
 
-  const endpoint = useMemo(() => endpointFor(mode), [mode]);
+  // --- Realtime session management ---
+
+  const pushEvent = useCallback((message: string) => {
+    const time = new Date().toLocaleTimeString();
+    setEvents((prev) => [...prev.slice(-(MAX_TRANSPORT_EVENTS - 1)), `${time}  ${message}`]);
+  }, []);
+
+  const teardownSession = useCallback(() => {
+    sessionRef.current?.dispose();
+    sessionRef.current = null;
+    setConnectionState('idle');
+    setDeadlineAt(null);
+  }, []);
+
+  const ensureSession = useCallback((): RealtimeSession => {
+    if (sessionRef.current) return sessionRef.current;
+    const session = new RealtimeSession({
+      endpoint: MODEL_ENDPOINT,
+      getActiveMode: () => modeRef.current,
+      onFrame: (frame) => {
+        setViewerMesh({ kind: 'geometry', positions: frame.positions, indices: frame.indices });
+        setStats({
+          vertices: frame.numVertices,
+          faces: frame.numFaces,
+          seed: frame.seed,
+          handlerMs: frame.handlerMs,
+        });
+        setLatencyMs(frame.latencyMs);
+        setStatus('done');
+        setError(null);
+      },
+      onError: (message) => {
+        setError(message);
+        setStatus('error');
+      },
+      onStateChange: (state, deadline) => {
+        setConnectionState(state);
+        setDeadlineAt(deadline);
+        if (state === 'idle') {
+          // A close mid-generate would otherwise leave the status spinning.
+          setStatus((prev) => (prev === 'running' ? 'idle' : prev));
+        }
+      },
+      onEvent: pushEvent,
+    });
+    sessionRef.current = session;
+    return session;
+  }, [pushEvent]);
+
+  // The realtime session authenticated with the key configured when it
+  // connected; close it immediately whenever the key changes or clears.
+  useEffect(() => {
+    teardownSession();
+  }, [apiKey, teardownSession]);
+
+  // Close the socket when the tab is hidden or unloading, and dispose on
+  // unmount. It reopens on the next generate/control action.
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') sessionRef.current?.close('page hidden');
+    };
+    const handleBeforeUnload = () => sessionRef.current?.close('page unload');
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      sessionRef.current?.dispose();
+      sessionRef.current = null;
+    };
+  }, []);
+
+  // Tick the dead-man countdown shown while the session is open.
+  useEffect(() => {
+    if (deadlineAt == null) {
+      setClosesInS(null);
+      return;
+    }
+    const update = () =>
+      setClosesInS(Math.max(0, Math.ceil((deadlineAt - Date.now()) / 1000)));
+    update();
+    const timer = setInterval(update, 250);
+    return () => clearInterval(timer);
+  }, [deadlineAt]);
+
+  // --- Generation ---
 
   const runGenerate = useCallback(async () => {
     const key = apiKey.trim();
@@ -115,12 +234,28 @@ export default function Home() {
     }
 
     // Snapshot the input for the currently active mode.
-    const input =
+    const input: GnmInput =
       mode === 'semantic' ? semantic : mode === 'blend' ? blend : advanced;
 
     configureFal(key);
 
-    // Cancel any in-flight request and mark this one current.
+    if (realtime) {
+      // A fal.run response from before the transport toggle must not clobber
+      // newer realtime frames: kill any in-flight request and retire its id.
+      abortRef.current?.abort();
+      abortRef.current = null;
+      requestIdRef.current += 1;
+      // One realtime frame. The session handles (re)connecting, request-id
+      // ordering, stale-frame suppression, topology caching, and the
+      // inactivity dead-man.
+      setStatus('running');
+      setError(null);
+      ensureSession().send(mode, input);
+      return;
+    }
+
+    // Direct fal.run request. Abort any in-flight one and mark this one
+    // current; the id guard also drops stale responses that abort misses.
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
@@ -129,21 +264,10 @@ export default function Home() {
 
     setStatus('running');
     setError(null);
-    setLogLines([]);
     const started = performance.now();
 
     try {
-      const data = await generate({
-        mode,
-        input,
-        signal: controller.signal,
-        onQueueUpdate: (update) => {
-          if (requestId !== requestIdRef.current) return;
-          if (update.logs?.length) {
-            setLogLines(update.logs.map((l) => l.message));
-          }
-        },
-      });
+      const data = await generate({ mode, input, signal: controller.signal });
 
       // Ignore stale responses (a newer request superseded this one).
       if (requestId !== requestIdRef.current) return;
@@ -151,8 +275,14 @@ export default function Home() {
       const url = data.model_mesh?.url;
       if (!url) throw new Error('Response did not include model_mesh.url.');
 
-      setResult(data);
-      setMeshDataUri(url);
+      setGlbResult(data);
+      setViewerMesh({ kind: 'glb', dataUri: url });
+      setStats({
+        vertices: data.num_vertices,
+        faces: data.num_faces,
+        seed: data.seed ?? null,
+        handlerMs: null,
+      });
       setLatencyMs(Math.round(performance.now() - started));
       setStatus('done');
     } catch (err) {
@@ -160,12 +290,16 @@ export default function Home() {
       setError(errorMessage(err));
       setStatus('error');
     }
-  }, [apiKey, mode, semantic, blend, advanced]);
+  }, [apiKey, mode, semantic, blend, advanced, realtime, ensureSession]);
 
-  const debounced = useDebouncedCallback(runGenerate, 450);
+  const debounced = useDebouncedCallback(
+    runGenerate,
+    realtime ? REALTIME_DEBOUNCE_MS : HTTP_DEBOUNCE_MS,
+  );
 
   // Auto-generate on committed control changes (debounced) once a key is set.
   const handleCommit = useCallback(() => {
+    sessionRef.current?.touch(); // control activity keeps a realtime session alive
     if (!autoGenerate) return;
     if (!apiKey.trim()) return;
     debounced.call();
@@ -176,18 +310,44 @@ export default function Home() {
     void runGenerate();
   }, [debounced, runGenerate]);
 
+  const handleModeChange = useCallback(
+    (next: Mode) => {
+      setMode(next);
+      sessionRef.current?.touch();
+      // On realtime the tab switch itself regenerates, so the viewer follows
+      // the active tab's payload without an extra click.
+      if (realtime && autoGenerate && apiKey.trim()) debounced.call();
+    },
+    [realtime, autoGenerate, apiKey, debounced],
+  );
+
+  const handleRealtimeChange = useCallback(
+    (next: boolean) => {
+      setRealtime(next);
+      if (!next) teardownSession();
+    },
+    [teardownSession],
+  );
+
   const handleDownload = useCallback(() => {
-    if (!result?.model_mesh?.url) return;
+    if (!glbResult?.model_mesh?.url) return;
     try {
-      const { bytes, contentType } = decodeDataUri(result.model_mesh.url);
-      const name = result.model_mesh.file_name || 'gnm_head.glb';
+      const { bytes, contentType } = decodeDataUri(glbResult.model_mesh.url);
+      const name = glbResult.model_mesh.file_name || 'gnm_head.glb';
       downloadBytes(bytes, name, contentType);
     } catch (err) {
       setError(errorMessage(err));
     }
-  }, [result]);
+  }, [glbResult]);
+
+  const endpoint = useMemo(
+    () => (realtime ? `${MODEL_ENDPOINT}/realtime` : endpointFor(mode)),
+    [mode, realtime],
+  );
 
   const hasKey = apiKey.trim().length > 0;
+  // Realtime frames are raw geometry — only a fal.run result yields a GLB.
+  const canDownload = viewerMesh?.kind === 'glb' && Boolean(glbResult?.model_mesh?.url);
 
   return (
     <main className="app">
@@ -208,7 +368,7 @@ export default function Home() {
 
       <div className="layout">
         <section className="viewer-pane">
-          <Viewer meshDataUri={meshDataUri} wireframe={wireframe} />
+          <Viewer mesh={viewerMesh} wireframe={wireframe} />
           <div className="viewer-overlay">
             <label className="toggle">
               <input
@@ -218,8 +378,11 @@ export default function Home() {
               />
               Wireframe
             </label>
+            {realtime && connectionState === 'open' && closesInS != null && (
+              <span className="viewer-badge">Realtime · closes in {closesInS}s</span>
+            )}
           </div>
-          {!meshDataUri && status !== 'running' && (
+          {!viewerMesh && status !== 'running' && (
             <div className="viewer-empty">
               <p>No mesh yet — set your key and generate a head.</p>
             </div>
@@ -234,7 +397,7 @@ export default function Home() {
                 role="tab"
                 aria-selected={mode === tab.id}
                 className={`tab ${mode === tab.id ? 'active' : ''}`}
-                onClick={() => setMode(tab.id)}
+                onClick={() => handleModeChange(tab.id)}
               >
                 {tab.label}
               </button>
@@ -265,6 +428,26 @@ export default function Home() {
             )}
           </div>
 
+          <div className={`transport-bar ${realtime ? 'realtime-on' : ''}`}>
+            <label className="toggle toggle-realtime">
+              <input
+                type="checkbox"
+                checked={realtime}
+                onChange={(e) => handleRealtimeChange(e.target.checked)}
+              />
+              <span>
+                <strong>Realtime</strong> (WebSocket)
+              </span>
+            </label>
+            <p className="transport-hint">
+              {realtime
+                ? `The socket opens on your next generate, is billed as a session while open, and auto-closes after ${
+                    REALTIME_INACTIVITY_MS / 1000
+                  }s without activity (the server enforces its own 10s cutoff).`
+                : 'Each generate is one direct fal.run HTTP request.'}
+            </p>
+          </div>
+
           <div className="action-bar">
             <label className="toggle">
               <input
@@ -278,9 +461,9 @@ export default function Home() {
               type="button"
               className="btn btn-primary"
               onClick={handleGenerateNow}
-              disabled={!hasKey || status === 'running'}
+              disabled={!hasKey || (!realtime && status === 'running')}
             >
-              {status === 'running' ? 'Generating…' : 'Generate'}
+              {!realtime && status === 'running' ? 'Generating…' : 'Generate'}
             </button>
           </div>
         </aside>
@@ -288,18 +471,28 @@ export default function Home() {
 
       <StatusBar
         endpoint={endpoint}
+        transport={realtime ? 'realtime' : 'fal.run'}
+        connection={realtime ? { state: connectionState, closesInS } : null}
         status={status}
         latencyMs={latencyMs}
-        result={result}
+        handlerMs={stats?.handlerMs ?? null}
+        vertices={stats?.vertices ?? null}
+        faces={stats?.faces ?? null}
+        seed={stats?.seed ?? null}
         error={error}
         onDownload={handleDownload}
-        canDownload={Boolean(result?.model_mesh?.url)}
+        canDownload={canDownload}
+        downloadHint={
+          viewerMesh?.kind === 'geometry'
+            ? 'Realtime frames are raw geometry — turn Realtime off and generate to get a GLB.'
+            : undefined
+        }
       />
 
-      {logLines.length > 0 && (
+      {events.length > 0 && (
         <details className="logs">
-          <summary>Request logs ({logLines.length})</summary>
-          <pre>{logLines.join('\n')}</pre>
+          <summary>Transport events ({events.length})</summary>
+          <pre>{events.join('\n')}</pre>
         </details>
       )}
 
@@ -308,7 +501,8 @@ export default function Home() {
           Model endpoint: <code>{MODEL_ENDPOINT}</code>
         </span>
         <span>
-          Always requested with <code>sync_mode: true</code> and GLB output.
+          fal.run requests use <code>sync_mode: true</code> + GLB; realtime streams raw
+          vertex buffers over WebSocket.
         </span>
       </footer>
     </main>
