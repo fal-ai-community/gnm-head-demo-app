@@ -54,7 +54,10 @@ code {
 .app {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  /* Fixed to the viewport so the main split can never grow the page;
+     tall control content scrolls inside .control-scroll instead. */
+  height: 100vh;
+  height: 100dvh;
   max-width: 1400px;
   margin: 0 auto;
   padding: 18px clamp(12px, 3vw, 28px) 28px;
@@ -149,6 +152,9 @@ code {
 .layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 380px;
+  /* The row must not track content height, or a tall control panel
+     stretches the viewer and the whole page with it. */
+  grid-template-rows: minmax(0, 1fr);
   gap: 16px;
   flex: 1;
   min-height: 0;
@@ -160,7 +166,10 @@ code {
   border: 1px solid var(--border-solid);
   border-radius: var(--radius);
   overflow: hidden;
-  min-height: 460px;
+  /* Viewport-relative floor so short windows degrade to page scroll
+     instead of the viewer painting over the status bar. */
+  min-height: min(460px, 55vh);
+  min-height: min(460px, 55dvh);
 }
 
 .viewer-canvas {
@@ -239,9 +248,10 @@ code {
 
 .control-scroll {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 12px;
-  min-height: 240px;
 }
 
 .controls {
@@ -556,16 +566,28 @@ input[type='range'] {
 
 /* --- Responsive --- */
 @media (max-width: 900px) {
+  /* Stacked layout: let the page scroll normally, keep the viewer at a
+     fixed clamped height, and bound the control scroller on its own. */
+  .app {
+    height: auto;
+    min-height: 100vh;
+    min-height: 100dvh;
+  }
   .layout {
     grid-template-columns: 1fr;
+    grid-template-rows: none;
+    flex: initial;
   }
   .viewer-pane {
-    min-height: 360px;
+    min-height: 0;
+    height: clamp(320px, 48vh, 520px);
+    height: clamp(320px, 48dvh, 520px);
   }
   .control-pane {
     max-height: none;
   }
   .control-scroll {
-    max-height: 60vh;
+    max-height: min(60vh, 540px);
+    max-height: min(60dvh, 540px);
   }
 }
