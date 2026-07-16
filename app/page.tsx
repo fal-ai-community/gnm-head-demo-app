@@ -27,6 +27,7 @@ import {
   type RealtimeConnectionState,
 } from '@/lib/realtimeSession';
 import { useDebouncedCallback } from '@/lib/useDebouncedCallback';
+import { useThrottledCallback } from '@/lib/useThrottledCallback';
 
 // The viewer touches WebGL/DOM, so it must never run during static prerender.
 const Viewer = dynamic(() => import('@/components/Viewer'), {
@@ -44,11 +45,15 @@ const TABS: { id: Mode; label: string }[] = [
 ];
 
 /**
- * Auto-generate debounce per transport: fal.run pays a full HTTP round-trip
- * per request, realtime frames are cheap and should feel live.
+ * Auto-generate pacing per transport. fal.run pays a full HTTP round-trip per
+ * request, so it waits for a pause in committed changes (trailing debounce on
+ * slider release / discrete change). Realtime frames are cheap and should
+ * track the drag itself, so every slider movement feeds a leading+trailing
+ * throttle: steady ~100 ms sends while the thumb moves, plus one final
+ * trailing send carrying the released value.
  */
 const HTTP_DEBOUNCE_MS = 450;
-const REALTIME_DEBOUNCE_MS = 100;
+const REALTIME_LIVE_INTERVAL_MS = 100;
 
 const MAX_TRANSPORT_EVENTS = 20;
 
@@ -92,6 +97,29 @@ export default function Home() {
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+
+  // Latest control values, updated synchronously by the appliers below.
+  // React state alone lands only after the next render, so a same-tick
+  // generate (the throttle's leading edge, fired inside the slider's input
+  // event) would otherwise send the previous value on every movement.
+  const semanticRef = useRef(semantic);
+  const blendRef = useRef(blend);
+  const advancedRef = useRef(advanced);
+
+  const applySemantic = useCallback((patch: Partial<SemanticInput>) => {
+    semanticRef.current = { ...semanticRef.current, ...patch };
+    setSemantic(semanticRef.current);
+  }, []);
+
+  const applyBlend = useCallback((patch: Partial<BlendInput>) => {
+    blendRef.current = { ...blendRef.current, ...patch };
+    setBlend(blendRef.current);
+  }, []);
+
+  const applyAdvanced = useCallback((patch: Partial<AdvancedInput>) => {
+    advancedRef.current = { ...advancedRef.current, ...patch };
+    setAdvanced(advancedRef.current);
+  }, []);
 
   // --- Restore a remembered key (opt-in, sessionStorage only) ---
   useEffect(() => {
@@ -233,9 +261,15 @@ export default function Home() {
       return;
     }
 
-    // Snapshot the input for the currently active mode.
+    // Snapshot the newest input for the currently active mode from the refs:
+    // a same-tick call out of a slider event must see the value just applied.
+    const activeMode = modeRef.current;
     const input: GnmInput =
-      mode === 'semantic' ? semantic : mode === 'blend' ? blend : advanced;
+      activeMode === 'semantic'
+        ? semanticRef.current
+        : activeMode === 'blend'
+          ? blendRef.current
+          : advancedRef.current;
 
     configureFal(key);
 
@@ -250,7 +284,7 @@ export default function Home() {
       // inactivity dead-man.
       setStatus('running');
       setError(null);
-      ensureSession().send(mode, input);
+      ensureSession().send(activeMode, input);
       return;
     }
 
@@ -267,7 +301,7 @@ export default function Home() {
     const started = performance.now();
 
     try {
-      const data = await generate({ mode, input, signal: controller.signal });
+      const data = await generate({ mode: activeMode, input, signal: controller.signal });
 
       // Ignore stale responses (a newer request superseded this one).
       if (requestId !== requestIdRef.current) return;
@@ -290,43 +324,90 @@ export default function Home() {
       setError(errorMessage(err));
       setStatus('error');
     }
-  }, [apiKey, mode, semantic, blend, advanced, realtime, ensureSession]);
+  }, [apiKey, realtime, ensureSession]);
 
-  const debounced = useDebouncedCallback(
-    runGenerate,
-    realtime ? REALTIME_DEBOUNCE_MS : HTTP_DEBOUNCE_MS,
-  );
+  const httpDebounce = useDebouncedCallback(runGenerate, HTTP_DEBOUNCE_MS);
+  const liveThrottle = useThrottledCallback(runGenerate, REALTIME_LIVE_INTERVAL_MS);
 
-  // Auto-generate on committed control changes (debounced) once a key is set.
-  const handleCommit = useCallback(() => {
-    sessionRef.current?.touch(); // control activity keeps a realtime session alive
+  // Realtime live path: every control change (each slider `input` event, not
+  // just the release) feeds the throttle, so frames flow at a steady
+  // ~REALTIME_LIVE_INTERVAL_MS cadence during a sustained drag and the
+  // trailing edge sends the final value.
+  const handleLiveChange = useCallback(() => {
+    if (!realtime) return;
+    sessionRef.current?.touch(); // control activity keeps the session alive
     if (!autoGenerate) return;
     if (!apiKey.trim()) return;
-    debounced.call();
-  }, [autoGenerate, apiKey, debounced]);
+    liveThrottle.call();
+  }, [realtime, autoGenerate, apiKey, liveThrottle]);
+
+  // Committed changes (slider release, discrete control, seed blur). On
+  // fal.run this is the only auto-generate trigger — a trailing debounce so
+  // dragging costs one HTTP request per pause, not one per movement. On
+  // realtime the live path above already generated for the change itself
+  // (its trailing edge covers the released value), so a commit only counts
+  // as session activity; generating here too would duplicate the send.
+  const handleCommit = useCallback(() => {
+    sessionRef.current?.touch();
+    if (realtime) return;
+    if (!autoGenerate) return;
+    if (!apiKey.trim()) return;
+    httpDebounce.call();
+  }, [realtime, autoGenerate, apiKey, httpDebounce]);
 
   const handleGenerateNow = useCallback(() => {
-    debounced.cancel();
+    httpDebounce.cancel();
+    liveThrottle.cancel();
     void runGenerate();
-  }, [debounced, runGenerate]);
+  }, [httpDebounce, liveThrottle, runGenerate]);
 
   const handleModeChange = useCallback(
     (next: Mode) => {
       setMode(next);
+      // Synchronous so a same-tick generate below targets the new tab.
+      modeRef.current = next;
       sessionRef.current?.touch();
       // On realtime the tab switch itself regenerates, so the viewer follows
       // the active tab's payload without an extra click.
-      if (realtime && autoGenerate && apiKey.trim()) debounced.call();
+      if (realtime && autoGenerate && apiKey.trim()) liveThrottle.call();
     },
-    [realtime, autoGenerate, apiKey, debounced],
+    [realtime, autoGenerate, apiKey, liveThrottle],
   );
 
   const handleRealtimeChange = useCallback(
     (next: boolean) => {
+      // Drop anything scheduled under the old transport so it cannot fire
+      // as a late send on the new one.
+      httpDebounce.cancel();
+      liveThrottle.cancel();
       setRealtime(next);
       if (!next) teardownSession();
     },
-    [teardownSession],
+    [httpDebounce, liveThrottle, teardownSession],
+  );
+
+  const handleSemanticChange = useCallback(
+    (patch: Partial<SemanticInput>) => {
+      applySemantic(patch);
+      handleLiveChange();
+    },
+    [applySemantic, handleLiveChange],
+  );
+
+  const handleBlendChange = useCallback(
+    (patch: Partial<BlendInput>) => {
+      applyBlend(patch);
+      handleLiveChange();
+    },
+    [applyBlend, handleLiveChange],
+  );
+
+  const handleAdvancedChange = useCallback(
+    (patch: Partial<AdvancedInput>) => {
+      applyAdvanced(patch);
+      handleLiveChange();
+    },
+    [applyAdvanced, handleLiveChange],
   );
 
   const handleDownload = useCallback(() => {
@@ -408,21 +489,21 @@ export default function Home() {
             {mode === 'semantic' && (
               <SemanticControls
                 value={semantic}
-                onChange={(patch) => setSemantic((s) => ({ ...s, ...patch }))}
+                onChange={handleSemanticChange}
                 onCommit={handleCommit}
               />
             )}
             {mode === 'blend' && (
               <BlendControls
                 value={blend}
-                onChange={(patch) => setBlend((s) => ({ ...s, ...patch }))}
+                onChange={handleBlendChange}
                 onCommit={handleCommit}
               />
             )}
             {mode === 'advanced' && (
               <AdvancedControls
                 value={advanced}
-                onChange={(patch) => setAdvanced((s) => ({ ...s, ...patch }))}
+                onChange={handleAdvancedChange}
                 onCommit={handleCommit}
               />
             )}

@@ -40,12 +40,16 @@ of that, the app can be exported as a static site.
   static topology cached, normals recomputed). Orbit controls, responsive
   resize, a clay PBR material, a wireframe toggle, and full disposal of GPU
   resources when switching transports or unmounting.
-- **Interactive by default** — slider changes are debounced and auto-generate
-  (450 ms on fal.run, 100 ms on realtime); there is also an explicit
-  **Generate** button. On fal.run, in-flight requests are aborted
-  (`abortSignal`) and stale responses are ignored; on realtime, every frame
-  carries a monotonically unique `request_id` and stale/out-of-mode frames are
-  dropped, so rapid edits never race.
+- **Interactive by default** — on fal.run, control changes auto-generate on
+  commit (slider release / discrete change) behind a 450 ms trailing debounce,
+  so a drag costs one HTTP request per pause. On realtime, every slider
+  movement feeds a 100 ms leading+trailing throttle, so the mesh follows the
+  drag itself at a steady cadence and the trailing edge sends the released
+  value (no duplicate send on release). There is also an explicit **Generate**
+  button. On fal.run, in-flight requests are aborted (`abortSignal`) and stale
+  responses are ignored; on realtime, every frame carries a monotonically
+  unique `request_id` and stale/out-of-mode frames are dropped, so rapid edits
+  never race.
 - **Request telemetry** — the active endpoint, transport, session state with
   dead-man countdown, latency, server handler time (realtime), vertex/face
   counts, and resolved seed. A small transport-event log records realtime
@@ -71,7 +75,7 @@ Open <http://localhost:3000>, paste a fal key, and generate.
 | `npm run start`     | Serve a non-static build (`NEXT_OUTPUT=server`).   |
 | `npm run lint`      | ESLint.                                            |
 | `npm run typecheck` | `tsc --noEmit`.                                    |
-| `npm test`          | Node test runner over the pure protocol helpers.   |
+| `npm test`          | Node test runner over the pure helpers (protocol, throttle). |
 
 ### Static export
 
@@ -135,7 +139,7 @@ Messages are msgpack-encoded, so binary fields travel natively (no base64).
 
 ### Wire protocol
 
-Request (one per generation/slider commit):
+Request (one per generation — throttled slider movements included):
 
 ```jsonc
 {
@@ -229,9 +233,13 @@ lib/
   realtimeSession.ts   Realtime session manager: lazy connect, topology cache,
                        inactivity dead-man, transparent reconnect-on-send
   mesh.ts              data-URI / base64 decoding, ViewerMesh union, GLB download
+  throttle.ts          Pure leading+trailing throttle for realtime live updates
+                       (unit-tested, injectable clock/scheduler)
   useDebouncedCallback.ts
+  useThrottledCallback.ts
 test/
   protocol.test.ts     Node test runner tests for lib/protocol.ts
+  throttle.test.ts     Node test runner tests for lib/throttle.ts
 ```
 
 ## Limitations
