@@ -173,9 +173,83 @@ code {
 }
 
 .viewer-canvas {
+  position: relative;
   width: 100%;
   height: 100%;
   display: block;
+  /* Lets .diffusion-overlay-video size itself in cq units (see below). */
+  container-type: size;
+}
+
+.viewer-gl {
+  width: 100%;
+  height: 100%;
+}
+
+.viewer-gl canvas {
+  display: block;
+}
+
+/* --- Diffusion overlay (FLUX.2 klein realtime) --- */
+/* Sits over the WebGL canvas but never intercepts input, so OrbitControls
+   and the head sliders keep driving the scene underneath. */
+.diffusion-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  pointer-events: none;
+}
+
+/* Lucy's WebRTC output comes back at the model's fixed landscape working
+   resolution: the square input feed is stretched to fit it, not cropped.
+   Undo that by drawing the video as a square again — object-fit: fill on a
+   square element maps the content back to its true proportions regardless of
+   the intrinsic frame size (and is a no-op if the output ever is square).
+   The square covers the pane (side = the larger pane dimension, centered,
+   cropped by the pane's overflow), which is exactly the geometry
+   object-fit: cover gives the square klein image above. */
+.diffusion-overlay-video {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: max(100cqw, 100cqh);
+  height: max(100cqw, 100cqh);
+  transform: translate(-50%, -50%);
+  object-fit: fill;
+  pointer-events: none;
+}
+
+/* Small picture-in-picture of the raw clay render under the overlay. */
+.diffusion-pip {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  align-items: flex-end;
+  pointer-events: none;
+}
+
+.diffusion-pip canvas {
+  display: block;
+  width: 128px;
+  height: 128px;
+  border: 1px solid var(--border-solid);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+}
+
+.diffusion-pip-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  padding: 1px 6px;
+  border-radius: 8px;
 }
 
 .viewer-loading {
@@ -483,6 +557,57 @@ input[type='range'] {
 
 .transport-bar.realtime-on .transport-hint {
   color: var(--text-dim);
+}
+
+/* --- Diffusion bar (checkbox + prompt) --- */
+.diffusion-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border-solid);
+  background: var(--bg);
+}
+
+.diffusion-bar.diffusion-on {
+  background: color-mix(in srgb, var(--warn) 7%, var(--bg));
+  border-top-color: color-mix(in srgb, var(--warn) 40%, var(--border-solid));
+}
+
+.toggle-diffusion {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.diffusion-model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.diffusion-model-row label {
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.diffusion-model-row select {
+  flex: 1;
+  min-width: 0;
+}
+
+.diffusion-prompt:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.diffusion-bar.diffusion-on .transport-hint {
+  color: var(--text-dim);
+}
+
+.viewer-badge-diffusion {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 40%, transparent);
 }
 
 .viewer-badge {

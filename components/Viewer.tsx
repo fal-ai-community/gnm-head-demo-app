@@ -1,11 +1,32 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, type SyntheticEvent } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 
 import { base64ToBytes, decodeDataUri, type ViewerMesh } from '@/lib/mesh';
+import { createThrottle, type Throttle } from '@/lib/throttle';
+
+/**
+ * Diffusion capture format, per the FLUX.2 [klein] realtime guidance:
+ * 704x704 JPEG at 50% quality is the endpoint's optimal input.
+ */
+const CAPTURE_SIZE = 704;
+const CAPTURE_JPEG_QUALITY = 0.5;
+/** Pace captures during a sustained orbit/slider drag (leading+trailing). */
+const CAPTURE_THROTTLE_MS = 125;
+
+/** Square side and frame rate of the WebRTC input feed (Lucy video mode). */
+const STREAM_SIZE = 512;
+const STREAM_FPS = 24;
+
+/**
+ * How the diffusion model consumes the rendered view: 'frames' captures
+ * throttled JPEG data URIs (FLUX klein over WebSocket); 'stream' exposes the
+ * render as a continuous MediaStream (Lucy over WebRTC).
+ */
+export type DiffusionInputMode = 'frames' | 'stream';
 
 interface ViewerProps {
   /**
@@ -14,6 +35,25 @@ interface ViewerProps {
    */
   mesh: ViewerMesh | null;
   wireframe: boolean;
+  /** When true, rendered frames are captured and streamed for diffusion. */
+  diffusionEnabled?: boolean;
+  /** See {@link DiffusionInputMode}. */
+  diffusionInput?: DiffusionInputMode;
+  /** Latest diffused frame (blob URL) shown over the raw render ('frames' mode). */
+  diffusionImageUrl?: string | null;
+  /** Transformed remote video shown over the raw render ('stream' mode). */
+  diffusionVideoStream?: MediaStream | null;
+  /** Receives a 704x704 JPEG data URI of the rendered frame, throttled. */
+  onDiffusionCapture?: (dataUri: string) => void;
+  /**
+   * Receives the live capture MediaStream of the rendered view while
+   * 'stream' mode is enabled, and null when it is torn down.
+   */
+  onDiffusionStream?: (stream: MediaStream | null) => void;
+  /** Reports the remote video's intrinsic resolution (diagnostics). */
+  onDiffusionVideoSize?: (width: number, height: number) => void;
+  /** Bump to force a re-capture without a scene change (e.g. prompt edit). */
+  captureNonce?: number;
 }
 
 /** Clay-style PBR material shared by the GLB and realtime paths. */
@@ -52,7 +92,18 @@ interface RealtimeModel {
   indices: Uint32Array;
 }
 
-export default function Viewer({ mesh, wireframe }: ViewerProps) {
+export default function Viewer({
+  mesh,
+  wireframe,
+  diffusionEnabled = false,
+  diffusionInput = 'frames',
+  diffusionImageUrl = null,
+  diffusionVideoStream = null,
+  onDiffusionCapture,
+  onDiffusionStream,
+  onDiffusionVideoSize,
+  captureNonce = 0,
+}: ViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   // Long-lived three.js objects, kept across renders.
@@ -63,6 +114,48 @@ export default function Viewer({ mesh, wireframe }: ViewerProps) {
   const glbRootRef = useRef<THREE.Object3D | null>(null);
   const realtimeRef = useRef<RealtimeModel | null>(null);
   const wireframeRef = useRef(wireframe);
+
+  // --- Diffusion capture state (all refs: read inside the RAF loop) ---
+  const diffusionEnabledRef = useRef(diffusionEnabled);
+  const diffusionInputRef = useRef<DiffusionInputMode>(diffusionInput);
+  const onCaptureRef = useRef(onDiffusionCapture);
+  onCaptureRef.current = onDiffusionCapture;
+  const onStreamRef = useRef(onDiffusionStream);
+  onStreamRef.current = onDiffusionStream;
+  const onVideoSizeRef = useRef(onDiffusionVideoSize);
+  onVideoSizeRef.current = onDiffusionVideoSize;
+  /** Set by the capture throttle; consumed right after the next render. */
+  const captureDueRef = useRef(false);
+  /** Reusable offscreen canvas for the 704x704 center-cropped JPEG. */
+  const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  /** Offscreen canvas blitted every frame and exposed via captureStream(). */
+  const streamCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  /** Small picture-in-picture canvas showing the raw render under the overlay. */
+  const pipCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  /** The <video> element the transformed remote stream plays in. */
+  const overlayVideoRef = useRef<HTMLVideoElement | null>(null);
+  const captureThrottleRef = useRef<Throttle | null>(null);
+  if (captureThrottleRef.current === null) {
+    captureThrottleRef.current = createThrottle({
+      intervalMs: CAPTURE_THROTTLE_MS,
+      fn: () => {
+        captureDueRef.current = true;
+      },
+    });
+  }
+
+  /**
+   * Request a diffusion capture of the next rendered frame. Safe to call from
+   * anywhere (controls events, mesh updates); throttled so a sustained drag
+   * streams at a steady cadence with a trailing capture of the settled frame.
+   */
+  const markCaptureDirty = useCallback(() => {
+    if (!diffusionEnabledRef.current || !onCaptureRef.current) return;
+    // In 'stream' mode the render is fed continuously over the MediaStream;
+    // there is no per-frame JPEG capture to schedule.
+    if (diffusionInputRef.current !== 'frames') return;
+    captureThrottleRef.current?.call();
+  }, []);
 
   // --- One-time scene setup + render loop ---
   useEffect(() => {
@@ -112,11 +205,74 @@ export default function Viewer({ mesh, wireframe }: ViewerProps) {
     fill.position.set(0, -1, 1);
     scene.add(fill);
 
+    // Camera movement (orbit/zoom/pan, including damping) re-captures for
+    // diffusion. The throttle collapses the per-frame change events.
+    controls.addEventListener('change', markCaptureDirty);
+
+    /**
+     * Center-crop the freshly rendered WebGL canvas into a square. Must run in
+     * the same task as renderer.render() — the WebGL back buffer is only
+     * guaranteed readable before the browser composites (no
+     * preserveDrawingBuffer needed this way).
+     */
+    const blitSquare = (target: HTMLCanvasElement) => {
+      const source = renderer.domElement;
+      const s = Math.min(source.width, source.height);
+      if (s === 0) return false;
+      const ctx = target.getContext('2d');
+      if (!ctx) return false;
+      ctx.drawImage(
+        source,
+        (source.width - s) / 2,
+        (source.height - s) / 2,
+        s,
+        s,
+        0,
+        0,
+        target.width,
+        target.height,
+      );
+      return true;
+    };
+
+    const afterRender = () => {
+      if (!diffusionEnabledRef.current) return;
+      // Nothing worth diffusing (or paying for) until a head exists.
+      const hasModel = glbRootRef.current !== null || realtimeRef.current !== null;
+      if (!hasModel) return;
+
+      const pip = pipCanvasRef.current;
+      if (pip) blitSquare(pip);
+
+      // 'stream' mode: refresh the captureStream() source canvas every frame;
+      // WebRTC picks the frames up from there. No JPEG capture path.
+      if (diffusionInputRef.current === 'stream') {
+        const streamCanvas = streamCanvasRef.current;
+        if (streamCanvas) blitSquare(streamCanvas);
+        return;
+      }
+
+      if (!captureDueRef.current) return;
+      const onCapture = onCaptureRef.current;
+      if (!onCapture) return;
+      let canvas = captureCanvasRef.current;
+      if (!canvas) {
+        canvas = document.createElement('canvas');
+        canvas.width = CAPTURE_SIZE;
+        canvas.height = CAPTURE_SIZE;
+        captureCanvasRef.current = canvas;
+      }
+      if (!blitSquare(canvas)) return; // zero-sized canvas; retry next frame
+      captureDueRef.current = false;
+      onCapture(canvas.toDataURL('image/jpeg', CAPTURE_JPEG_QUALITY));
+    };
+
     let raf = 0;
     const animate = () => {
       raf = requestAnimationFrame(animate);
       controls.update();
       renderer.render(scene, camera);
+      afterRender();
     };
     animate();
 
@@ -127,6 +283,7 @@ export default function Viewer({ mesh, wireframe }: ViewerProps) {
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
+      markCaptureDirty();
     };
     const observer = new ResizeObserver(handleResize);
     observer.observe(container);
@@ -134,8 +291,11 @@ export default function Viewer({ mesh, wireframe }: ViewerProps) {
 
     return () => {
       cancelAnimationFrame(raf);
+      captureThrottleRef.current?.cancel();
+      captureDueRef.current = false;
       observer.disconnect();
       window.removeEventListener('resize', handleResize);
+      controls.removeEventListener('change', markCaptureDirty);
       disposeGlb();
       disposeRealtime();
       controls.dispose();
@@ -239,6 +399,7 @@ export default function Viewer({ mesh, wireframe }: ViewerProps) {
     if (mesh.kind === 'geometry') {
       disposeGlb();
       updateRealtimeModel(mesh, scene, camera, controls);
+      markCaptureDirty();
       return;
     }
 
@@ -267,6 +428,7 @@ export default function Viewer({ mesh, wireframe }: ViewerProps) {
         frameModel(model, camera, controls);
         scene.add(model);
         glbRootRef.current = model;
+        markCaptureDirty();
       },
       (err) => {
         console.error('GLTFLoader failed to parse the GLB', err);
@@ -299,9 +461,92 @@ export default function Viewer({ mesh, wireframe }: ViewerProps) {
     }
     const realtimeModel = realtimeRef.current;
     if (realtimeModel) realtimeModel.material.wireframe = wireframe;
-  }, [wireframe]);
+    markCaptureDirty();
+  }, [wireframe, markCaptureDirty]);
 
-  return <div ref={containerRef} className="viewer-canvas" aria-label="3D head viewer" role="img" />;
+  // --- Diffusion enable/disable + forced re-captures ---
+  useEffect(() => {
+    diffusionEnabledRef.current = diffusionEnabled;
+    diffusionInputRef.current = diffusionInput;
+    if (diffusionEnabled && diffusionInput === 'frames') {
+      // Capture the current frame right away so toggling the box (or editing
+      // the prompt, via captureNonce) diffuses without needing camera motion.
+      markCaptureDirty();
+    } else {
+      captureThrottleRef.current?.cancel();
+      captureDueRef.current = false;
+    }
+  }, [diffusionEnabled, diffusionInput, captureNonce, markCaptureDirty]);
+
+  // --- 'stream' mode: expose the render as a live MediaStream ---
+  useEffect(() => {
+    if (!diffusionEnabled || diffusionInput !== 'stream') return;
+    const canvas = document.createElement('canvas');
+    canvas.width = STREAM_SIZE;
+    canvas.height = STREAM_SIZE;
+    streamCanvasRef.current = canvas;
+    const stream = canvas.captureStream(STREAM_FPS);
+    onStreamRef.current?.(stream);
+    return () => {
+      streamCanvasRef.current = null;
+      for (const track of stream.getTracks()) track.stop();
+      onStreamRef.current?.(null);
+    };
+  }, [diffusionEnabled, diffusionInput]);
+
+  const showImageOverlay =
+    diffusionEnabled && diffusionInput === 'frames' && Boolean(diffusionImageUrl);
+  const showVideoOverlay =
+    diffusionEnabled && diffusionInput === 'stream' && Boolean(diffusionVideoStream);
+  const showOverlay = showImageOverlay || showVideoOverlay;
+
+  // Attach the remote stream to the overlay <video> once both exist.
+  useEffect(() => {
+    const video = overlayVideoRef.current;
+    if (!video) return;
+    video.srcObject = showVideoOverlay ? diffusionVideoStream : null;
+  }, [showVideoOverlay, diffusionVideoStream]);
+
+  /** Fires on loadedmetadata and any mid-stream resolution change. */
+  const reportVideoSize = useCallback((event: SyntheticEvent<HTMLVideoElement>) => {
+    const { videoWidth, videoHeight } = event.currentTarget;
+    if (videoWidth > 0 && videoHeight > 0) {
+      onVideoSizeRef.current?.(videoWidth, videoHeight);
+    }
+  }, []);
+
+  return (
+    <div className="viewer-canvas" aria-label="3D head viewer" role="img">
+      {/* three.js appends its canvas here; React never touches this subtree. */}
+      <div ref={containerRef} className="viewer-gl" />
+      {showImageOverlay && (
+        // eslint-disable-next-line @next/next/no-img-element -- blob URL frames streamed over WebSocket; next/image adds nothing here.
+        <img
+          className="diffusion-overlay"
+          src={diffusionImageUrl as string}
+          alt="Diffused render"
+        />
+      )}
+      {showVideoOverlay && (
+        <video
+          ref={overlayVideoRef}
+          className="diffusion-overlay-video"
+          autoPlay
+          playsInline
+          muted
+          aria-label="Diffused render (live video)"
+          onLoadedMetadata={reportVideoSize}
+          onResize={reportVideoSize}
+        />
+      )}
+      {showOverlay && (
+        <div className="diffusion-pip" aria-hidden="true">
+          <canvas ref={pipCanvasRef} width={160} height={160} />
+          <span className="diffusion-pip-label">raw render</span>
+        </div>
+      )}
+    </div>
+  );
 }
 
 /**
